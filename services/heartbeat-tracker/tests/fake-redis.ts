@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+import { PRUNE_STALE_SENSOR_SCRIPT } from '../src/index.js';
+
 function parseBound(bound: number | string): {
   value: number;
   exclusive: boolean;
@@ -146,14 +148,55 @@ export class FakeRedis {
   }
 
   /**
-   * Test double for the heartbeat compare-and-set Lua script used in
-   * production. Mirrors its semantics: `lastSeen` only advances when the
-   * incoming event timestamp is strictly newer than what is stored.
+   * Test double for the Lua scripts used in production. The heartbeat script
+   * only advances `lastSeen` when the incoming event timestamp is strictly
+   * newer than what is stored; the prune script only removes a sensor that is
+   * still stale at execution time.
    */
   async eval(
-    _script: string,
+    script: string,
     numkeys: number,
     ...rest: Array<string | number>
+  ): Promise<unknown> {
+    if (script === PRUNE_STALE_SENSOR_SCRIPT) {
+      return this.evalPrune(numkeys, rest);
+    }
+    return this.evalHeartbeat(numkeys, rest);
+  }
+
+  private async evalPrune(
+    numkeys: number,
+    rest: Array<string | number>
+  ): Promise<number> {
+    const [key, sensorsKey, lastSeenIndexKey] = rest.slice(
+      0,
+      numkeys
+    ) as string[];
+    const [sensorId, cutoffRaw] = rest.slice(numkeys);
+    if (
+      key === undefined ||
+      sensorsKey === undefined ||
+      lastSeenIndexKey === undefined ||
+      typeof sensorId !== 'string'
+    ) {
+      throw new Error('missing arguments for prune eval');
+    }
+    const hashLastSeen = Number.parseInt(
+      this.hashes.get(key)?.lastSeen ?? '',
+      10
+    );
+    const indexScore = this.zsets.get(lastSeenIndexKey)?.get(sensorId);
+    const lastSeen = Number.isFinite(hashLastSeen) ? hashLastSeen : indexScore;
+    if (lastSeen !== undefined && lastSeen >= Number(cutoffRaw)) return 0;
+    await this.srem(sensorsKey, sensorId);
+    await this.del(key);
+    await this.zrem(lastSeenIndexKey, sensorId);
+    return 1;
+  }
+
+  private async evalHeartbeat(
+    numkeys: number,
+    rest: Array<string | number>
   ): Promise<[number, number, number, number, number]> {
     const keys = rest.slice(0, numkeys) as string[];
     const args = rest.slice(numkeys);

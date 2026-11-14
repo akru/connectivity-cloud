@@ -74,6 +74,31 @@ const validSensor = {
   uptime_seconds: 45,
 };
 
+const validPubsub = {
+  connectedPeerCount: 4,
+  minConnectedPeers: 1,
+  kafkaPaused: false,
+  publishSuccess: 10,
+  publishFailure: 0,
+  pauseCount: 0,
+  resumeCount: 0,
+};
+
+const validAnchor = {
+  observedAt: '2026-11-11T08:59:30.000Z',
+  queuedBatches: 2,
+  lastFinalizedAt: null,
+  lastFinalizedBlock: null,
+  lastBatchId: null,
+  lastFinalizedObservationStale: null,
+  freeBalance: null,
+  tokenSymbol: null,
+  tokenDecimals: null,
+  bestBlock: '10',
+  finalizedBlock: null,
+  finalizationGap: null,
+};
+
 describe('status aggregation', () => {
   it('uses the documented precedence and preserves unknown data', () => {
     expect(aggregateServiceStates(['operational', 'unknown'])).toBe('unknown');
@@ -479,7 +504,7 @@ describe('status aggregation', () => {
           if (failing) throw new Error('upstream down');
           return new Response(
             String(input).includes('/metrics')
-              ? JSON.stringify({ connectedPeerCount: 3 })
+              ? JSON.stringify({ ...validPubsub, connectedPeerCount: 3 })
               : JSON.stringify(sensorPage([validSensor])),
             { status: 200 }
           );
@@ -526,9 +551,7 @@ describe('status aggregation', () => {
           }
           return new Response(
             JSON.stringify(
-              String(input).includes('anchor')
-                ? { queuedBatches: 2, bestBlock: '10' }
-                : { connectedPeerCount: 4 }
+              String(input).includes('anchor') ? validAnchor : validPubsub
             ),
             { status: 200 }
           );
@@ -553,5 +576,142 @@ describe('status aggregation', () => {
       fetchedAt: '2026-11-11T09:00:00.000Z',
       queuedBatches: 2,
     });
+  });
+
+  it('treats malformed or incomplete network responses as unavailable', async () => {
+    const bodies: Array<[unknown, unknown]> = [
+      [{}, {}],
+      [
+        { ...validPubsub, connectedPeerCount: undefined },
+        { ...validAnchor, observedAt: undefined },
+      ],
+      [
+        { ...validPubsub, kafkaPaused: 'no' },
+        { ...validAnchor, queuedBatches: 'many' },
+      ],
+      [
+        { ...validPubsub, publishFailure: -1 },
+        { ...validAnchor, bestBlock: undefined },
+      ],
+    ];
+    for (const [pubsubBody, anchorBody] of bodies) {
+      const collector = createStatusCollector(
+        options({
+          targets: [TARGETS.pubsub, TARGETS.anchor],
+          fetch: async (input) =>
+            new Response(
+              JSON.stringify(
+                String(input).includes('anchor') ? anchorBody : pubsubBody
+              ),
+              { status: 200 }
+            ),
+        })
+      );
+      const network = await collector.collectNetwork();
+      expect(network.pubsub).toEqual({ available: false, stale: false });
+      expect(network.blockchain).toEqual({ available: false, stale: false });
+      expect(network.observedAt).toBeNull();
+    }
+  });
+
+  it('accepts a complete anchor status whose observations are all null', async () => {
+    const collector = createStatusCollector(
+      options({
+        targets: [TARGETS.anchor],
+        fetch: async () =>
+          new Response(
+            JSON.stringify({
+              ...validAnchor,
+              queuedBatches: null,
+              bestBlock: null,
+            }),
+            { status: 200 }
+          ),
+      })
+    );
+    const network = await collector.collectNetwork();
+    expect(network.blockchain).toMatchObject({
+      available: true,
+      stale: false,
+      observedAt: '2026-11-11T08:59:30.000Z',
+      queuedBatches: null,
+    });
+  });
+
+  it('preserves the last valid network observation when a refresh is malformed', async () => {
+    let currentTime = Date.parse('2026-11-11T09:00:00Z');
+    let malformed = false;
+    const collector = createStatusCollector(
+      options({
+        targets: [TARGETS.pubsub],
+        cacheTtlMs: 1000,
+        now: () => currentTime,
+        fetch: async () =>
+          new Response(JSON.stringify(malformed ? {} : validPubsub), {
+            status: 200,
+          }),
+      })
+    );
+    expect((await collector.collectNetwork()).pubsub).toMatchObject({
+      available: true,
+      stale: false,
+      connectedPeerCount: 4,
+    });
+
+    malformed = true;
+    currentTime += 30_000;
+    expect((await collector.collectNetwork()).pubsub).toMatchObject({
+      available: true,
+      stale: true,
+      connectedPeerCount: 4,
+      fetchedAt: '2026-11-11T09:00:00.000Z',
+    });
+  });
+
+  it('enforces the maximum stale age on cached snapshots independently of the cache TTL', async () => {
+    let currentTime = Date.parse('2026-11-11T09:00:00Z');
+    let failing = false;
+    let requests = 0;
+    const collector = createStatusCollector(
+      options({
+        targets: [TARGETS.heartbeat],
+        cacheTtlMs: 30_000,
+        staleMaxAgeMs: 300_000,
+        now: () => currentTime,
+        fetch: async () => {
+          requests += 1;
+          if (failing) throw new Error('upstream down');
+          return new Response(JSON.stringify(sensorPage([validSensor])), {
+            status: 200,
+          });
+        },
+      })
+    );
+    expect(await collector.collectSensors()).toMatchObject({
+      available: true,
+      stale: false,
+    });
+
+    failing = true;
+    currentTime += 299_000;
+    expect(await collector.collectSensors()).toMatchObject({
+      available: true,
+      stale: true,
+    });
+    const requestsWhenStale = requests;
+
+    currentTime += 500;
+    expect(await collector.collectSensors()).toMatchObject({
+      available: true,
+      stale: true,
+    });
+    expect(requests).toBe(requestsWhenStale);
+
+    // 300.5s after the last good fetch: beyond staleMaxAgeMs but still inside
+    // the 30s cache TTL of the stale snapshot.
+    currentTime += 1_000;
+    const expired = await collector.collectSensors();
+    expect(expired).toMatchObject({ available: false, stale: false });
+    expect(requests).toBeGreaterThan(requestsWhenStale);
   });
 });

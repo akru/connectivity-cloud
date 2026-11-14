@@ -254,6 +254,112 @@ function parseSensorPage(
   };
 }
 
+interface ParsedPubsubMetrics {
+  observedAt?: string;
+  connectedPeerCount: number;
+  minConnectedPeers: number;
+  kafkaPaused: boolean;
+  publishSuccess: number;
+  publishFailure: number;
+  pauseCount: number;
+  resumeCount: number;
+}
+
+/**
+ * Validates a pubsub-broadcaster `/metrics` document. Every reported field is
+ * required so an empty or partial object can never pass for a healthy reading.
+ */
+function parsePubsubMetrics(
+  body: Record<string, unknown>
+): ParsedPubsubMetrics | null {
+  const connectedPeerCount = nonNegativeNumber(body.connectedPeerCount);
+  const minConnectedPeers = nonNegativeNumber(body.minConnectedPeers);
+  const publishSuccess = nonNegativeNumber(body.publishSuccess);
+  const publishFailure = nonNegativeNumber(body.publishFailure);
+  const pauseCount = nonNegativeNumber(body.pauseCount);
+  const resumeCount = nonNegativeNumber(body.resumeCount);
+  if (
+    connectedPeerCount === null ||
+    minConnectedPeers === null ||
+    publishSuccess === null ||
+    publishFailure === null ||
+    pauseCount === null ||
+    resumeCount === null ||
+    typeof body.kafkaPaused !== 'boolean'
+  ) {
+    return null;
+  }
+  return {
+    ...(validTimestamp(body.observedAt) ? { observedAt: body.observedAt } : {}),
+    connectedPeerCount,
+    minConnectedPeers,
+    kafkaPaused: body.kafkaPaused,
+    publishSuccess,
+    publishFailure,
+    pauseCount,
+    resumeCount,
+  };
+}
+
+interface ParsedAnchorStatus {
+  observedAt: string;
+  queuedBatches: number | null;
+  lastFinalizedAt: string | null;
+  lastFinalizedObservationStale: boolean | null;
+  lastFinalizedBlock: string | null;
+  lastBatchId: string | null;
+  freeBalance: string | null;
+  tokenSymbol: string | null;
+  tokenDecimals: number | null;
+  bestBlock: string | null;
+  finalizedBlock: string | null;
+  finalizationGap: number | null;
+}
+
+function text(value: unknown): string | null {
+  return typeof value === 'string' ? value : null;
+}
+
+function flag(value: unknown): boolean | null {
+  return typeof value === 'boolean' ? value : null;
+}
+
+/**
+ * Validates a blockchain-anchor `/status` document. The upstream always sends
+ * every key, using null for unobserved values, so a missing key or a value of
+ * the wrong type marks the whole document as malformed.
+ */
+function parseAnchorStatus(
+  body: Record<string, unknown>
+): ParsedAnchorStatus | null {
+  if (!validTimestamp(body.observedAt)) return null;
+  const invalid = Symbol('invalid');
+  const read = <T>(
+    key: string,
+    accept: (value: unknown) => T | null
+  ): T | null | typeof invalid => {
+    if (!(key in body)) return invalid;
+    const value = body[key];
+    if (value === null) return null;
+    return accept(value) ?? invalid;
+  };
+  const status = {
+    queuedBatches: read('queuedBatches', nonNegativeNumber),
+    lastFinalizedAt: read('lastFinalizedAt', text),
+    lastFinalizedObservationStale: read('lastFinalizedObservationStale', flag),
+    lastFinalizedBlock: read('lastFinalizedBlock', text),
+    lastBatchId: read('lastBatchId', text),
+    freeBalance: read('freeBalance', text),
+    tokenSymbol: read('tokenSymbol', text),
+    tokenDecimals: read('tokenDecimals', nonNegativeNumber),
+    bestBlock: read('bestBlock', text),
+    finalizedBlock: read('finalizedBlock', text),
+    finalizationGap: read('finalizationGap', finiteNumber),
+  };
+  if (Object.values(status).includes(invalid)) return null;
+  return { observedAt: body.observedAt, ...status } as ParsedAnchorStatus;
+}
+
 export function aggregateServiceStates(states: ServiceState[]): ServiceState {
   if (states.includes('outage')) return 'outage';
   if (states.includes('degraded')) return 'degraded';
@@ -302,13 +408,23 @@ export function createStatusCollector(options: StatusCollectorOptions) {
   const inFlight = new Map<string, Promise<unknown>>();
   const getIdToken = options.getIdToken ?? createGoogleAdcIdTokenProvider();
 
-  async function cached<T>(key: string, load: () => Promise<T>): Promise<T> {
+  async function cached<T>(
+    key: string,
+    load: () => Promise<T>,
+    expiryFor: (value: T, defaultExpiresAt: number) => number = (
+      _value,
+      defaultExpiresAt
+    ) => defaultExpiresAt
+  ): Promise<T> {
     const entry = caches.get(key);
     if (entry && entry.expiresAt > now()) return entry.value as T;
     const pending = inFlight.get(key);
     if (pending) return pending as Promise<T>;
     const request = load().then((value) => {
-      caches.set(key, { value, expiresAt: now() + cacheTtlMs });
+      caches.set(key, {
+        value,
+        expiresAt: expiryFor(value, now() + cacheTtlMs),
+      });
       if (caches.size > 100) {
         const oldest = [...caches.entries()].sort(
           (a, b) => a[1].expiresAt - b[1].expiresAt
@@ -444,7 +560,7 @@ export function createStatusCollector(options: StatusCollectorOptions) {
     cacheKey: string,
     parse: (body: Record<string, unknown>) => T | null
   ): Promise<Snapshot<T> | null> {
-    return cached(cacheKey, async () => {
+    const load = async (): Promise<Snapshot<T> | null> => {
       const targetUrl = targetUrlFor(name);
       if (!targetUrl) return null;
       let parsed: T | null = null;
@@ -475,7 +591,14 @@ export function createStatusCollector(options: StatusCollectorOptions) {
       }
       lastGood.delete(cacheKey);
       return null;
-    });
+    };
+    // A cached stale snapshot must not outlive staleMaxAgeMs, even when the
+    // cache TTL would keep it longer.
+    return cached(cacheKey, load, (snapshot, defaultExpiresAt) =>
+      snapshot?.stale
+        ? Math.min(defaultExpiresAt, snapshot.fetchedAt + staleMaxAgeMs + 1)
+        : defaultExpiresAt
+    );
   }
 
   async function collectSensors(
@@ -530,18 +653,16 @@ export function createStatusCollector(options: StatusCollectorOptions) {
     };
   }
 
-  function section<T extends object>(
-    snapshot: Snapshot<Record<string, unknown>> | null,
-    map: (body: Record<string, unknown>) => T
+  function section<T extends { observedAt?: string }, U extends object>(
+    snapshot: Snapshot<T> | null,
+    map: (value: T) => U
   ) {
     if (!snapshot) return { available: false as const, stale: false };
-    const upstreamObservedAt = snapshot.value.observedAt;
     return {
       available: true as const,
       stale: snapshot.stale,
-      observedAt: validTimestamp(upstreamObservedAt)
-        ? upstreamObservedAt
-        : new Date(snapshot.fetchedAt).toISOString(),
+      observedAt:
+        snapshot.value.observedAt ?? new Date(snapshot.fetchedAt).toISOString(),
       fetchedAt: new Date(snapshot.fetchedAt).toISOString(),
       ...map(snapshot.value),
     };
@@ -553,43 +674,37 @@ export function createStatusCollector(options: StatusCollectorOptions) {
         'pubsub-broadcaster',
         '/metrics',
         'pubsub-metrics',
-        (body) => body
+        parsePubsubMetrics
       ),
       fetchTarget(
         'blockchain-anchor',
         '/status',
         'anchor-status',
-        (body) => body
+        parseAnchorStatus
       ),
     ]);
-    const pubsub = section(pubsubSnapshot, (body) => ({
-      connectedPeerCount: finiteNumber(body.connectedPeerCount),
-      minConnectedPeers: finiteNumber(body.minConnectedPeers),
-      kafkaPaused:
-        typeof body.kafkaPaused === 'boolean' ? body.kafkaPaused : null,
-      publishSuccess: finiteNumber(body.publishSuccess),
-      publishFailure: finiteNumber(body.publishFailure),
-      pauseCount: finiteNumber(body.pauseCount),
-      resumeCount: finiteNumber(body.resumeCount),
+    const pubsub = section(pubsubSnapshot, (metrics) => ({
+      connectedPeerCount: metrics.connectedPeerCount,
+      minConnectedPeers: metrics.minConnectedPeers,
+      kafkaPaused: metrics.kafkaPaused,
+      publishSuccess: metrics.publishSuccess,
+      publishFailure: metrics.publishFailure,
+      pauseCount: metrics.pauseCount,
+      resumeCount: metrics.resumeCount,
       scope: 'process-local',
     }));
-    const text = (value: unknown): string | null =>
-      typeof value === 'string' ? value : null;
     const blockchain = section(anchorSnapshot, (anchor) => ({
-      queuedBatches: finiteNumber(anchor.queuedBatches),
-      lastFinalizedAt: text(anchor.lastFinalizedAt),
-      lastFinalizedObservationStale:
-        typeof anchor.lastFinalizedObservationStale === 'boolean'
-          ? anchor.lastFinalizedObservationStale
-          : null,
-      lastFinalizedBlock: text(anchor.lastFinalizedBlock),
-      lastBatchId: text(anchor.lastBatchId),
-      freeBalance: text(anchor.freeBalance),
-      tokenSymbol: text(anchor.tokenSymbol),
-      tokenDecimals: finiteNumber(anchor.tokenDecimals),
-      bestBlock: text(anchor.bestBlock),
-      finalizedBlock: text(anchor.finalizedBlock),
-      finalizationGap: finiteNumber(anchor.finalizationGap),
+      queuedBatches: anchor.queuedBatches,
+      lastFinalizedAt: anchor.lastFinalizedAt,
+      lastFinalizedObservationStale: anchor.lastFinalizedObservationStale,
+      lastFinalizedBlock: anchor.lastFinalizedBlock,
+      lastBatchId: anchor.lastBatchId,
+      freeBalance: anchor.freeBalance,
+      tokenSymbol: anchor.tokenSymbol,
+      tokenDecimals: anchor.tokenDecimals,
+      bestBlock: anchor.bestBlock,
+      finalizedBlock: anchor.finalizedBlock,
+      finalizationGap: anchor.finalizationGap,
     }));
     const observations = [pubsub, blockchain]
       .map((entry) => ('observedAt' in entry ? entry.observedAt : null))

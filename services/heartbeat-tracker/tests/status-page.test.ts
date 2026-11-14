@@ -152,6 +152,58 @@ describe('heartbeat sensor pages', () => {
     ).toBe(1);
   });
 
+  it('does not prune a sensor whose heartbeat arrives after it was selected for pruning', async () => {
+    const redis = new FakeRedis();
+    const tracker = create(redis);
+    await tracker.recordAuthorizedSensor('revived', NOW - RETENTION_MS - 1_000);
+    await tracker.recordAuthorizedSensor('expired', NOW - RETENTION_MS - 2_000);
+
+    const selectStale = redis.zrangebyscore.bind(redis);
+    redis.zrangebyscore = async (...args) => {
+      const staleIds = await selectStale(...args);
+      await tracker.recordAuthorizedSensor('revived', NOW - 500);
+      return staleIds;
+    };
+
+    const page = await tracker.getSensorPage();
+    expect(page.sensors.map((sensor) => sensor.sensor_id)).toEqual(['revived']);
+    expect(page.total).toBe(1);
+    expect(
+      await redis.hgetall('heartbeat-tracker:test:sensor:revived')
+    ).toMatchObject({ lastSeen: String(NOW - 500) });
+    expect(
+      await redis.hgetall('heartbeat-tracker:test:sensor:expired')
+    ).toEqual({});
+    expect(await redis.smembers('heartbeat-tracker:test:sensors')).toEqual([
+      'revived',
+    ]);
+  });
+
+  it('does not prune a revived sensor while computing metrics', async () => {
+    const redis = new FakeRedis();
+    const tracker = create(redis);
+    await tracker.recordAuthorizedSensor('revived', NOW - RETENTION_MS - 1_000);
+
+    const readHash = redis.hgetall.bind(redis);
+    let revived = false;
+    redis.hgetall = async (key) => {
+      const hash = await readHash(key);
+      if (!revived) {
+        revived = true;
+        await tracker.recordAuthorizedSensor('revived', NOW - 500);
+      }
+      return hash;
+    };
+
+    await tracker.createMetrics(0);
+    expect(
+      await redis.hgetall('heartbeat-tracker:test:sensor:revived')
+    ).toMatchObject({ lastSeen: String(NOW - 500) });
+    expect(await redis.smembers('heartbeat-tracker:test:sensors')).toEqual([
+      'revived',
+    ]);
+  });
+
   it('keeps an empty healthy dataset distinct from unavailable data', async () => {
     const { tracker } = await seed([]);
     const empty = await tracker.getSensorPage();

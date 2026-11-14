@@ -216,6 +216,43 @@ end
 return {0, isNew, firstSeen or eventTime, lastSeen, onlineSince or eventTime}
 `;
 
+/**
+ * Atomically prunes one sensor, but only if it is still stale.
+ *
+ * The last-seen timestamp is re-read inside the script, so a heartbeat that
+ * landed after the sensor was selected for pruning keeps its state. The sensor
+ * hash is authoritative; the index score is used when the hash is missing.
+ *
+ * KEYS[1] = sensor hash key
+ * KEYS[2] = sensors set key
+ * KEYS[3] = last-seen sorted set
+ * ARGV[1] = sensor id
+ * ARGV[2] = cutoff (ms); the sensor is pruned only when lastSeen < cutoff
+ *
+ * Returns 1 when the sensor was pruned, 0 when it was kept.
+ */
+export const PRUNE_STALE_SENSOR_SCRIPT = `
+local key = KEYS[1]
+local sensorsKey = KEYS[2]
+local lastSeenIndexKey = KEYS[3]
+local sensorId = ARGV[1]
+local cutoff = tonumber(ARGV[2])
+
+local lastSeen = tonumber(redis.call('HGET', key, 'lastSeen'))
+if lastSeen == nil then
+  lastSeen = tonumber(redis.call('ZSCORE', lastSeenIndexKey, sensorId))
+end
+
+if lastSeen ~= nil and lastSeen >= cutoff then
+  return 0
+end
+
+redis.call('SREM', sensorsKey, sensorId)
+redis.call('DEL', key)
+redis.call('ZREM', lastSeenIndexKey, sensorId)
+return 1
+`;
+
 const logger = pino({
   name: 'heartbeat-tracker',
   level:
@@ -264,6 +301,25 @@ export function createHeartbeatTrackerState(
   now: () => number = Date.now
 ): HeartbeatTrackerState {
   const keyspace = createHeartbeatTrackerKeyspace(redisKeyPrefix);
+
+  const pruneStaleSensors = async (
+    sensorIds: string[],
+    cutoff: number
+  ): Promise<void> => {
+    await Promise.all(
+      sensorIds.map((sensorId) =>
+        redis.eval(
+          PRUNE_STALE_SENSOR_SCRIPT,
+          3,
+          keyspace.sensor(sensorId),
+          keyspace.sensors,
+          keyspace.lastSeenIndex,
+          sensorId,
+          cutoff
+        )
+      )
+    );
+  };
 
   return {
     async recordAuthorizedSensor(
@@ -340,13 +396,7 @@ export function createHeartbeatTrackerState(
         logInfo('pruning stale sensors from Redis', {
           stale_count: staleIds.length,
         });
-        await Promise.all(
-          staleIds.map(async (sensorId) => {
-            await redis.srem(keyspace.sensors, sensorId);
-            await redis.del(keyspace.sensor(sensorId));
-            await redis.zrem(keyspace.lastSeenIndex, sensorId);
-          })
-        );
+        await pruneStaleSensors(staleIds, retentionCutoff);
       }
 
       const [onlineCount, visibleCount] = await Promise.all([
@@ -529,12 +579,9 @@ export function createHeartbeatTrackerState(
           stale_count: staleSensorIds.length,
           sensor_ids: staleSensorIds,
         });
-        await Promise.all(
-          staleSensorIds.map(async (sensorId) => {
-            await redis.srem(keyspace.sensors, sensorId);
-            await redis.del(keyspace.sensor(sensorId));
-            await redis.zrem(keyspace.lastSeenIndex, sensorId);
-          })
+        await pruneStaleSensors(
+          staleSensorIds,
+          currentTime - retentionWindowMs
         );
       }
 
